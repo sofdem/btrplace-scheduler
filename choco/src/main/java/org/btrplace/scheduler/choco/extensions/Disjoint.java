@@ -7,7 +7,6 @@
 package org.btrplace.scheduler.choco.extensions;
 
 
-import org.chocosolver.memory.IStateBitSet;
 import org.chocosolver.memory.IStateInt;
 import org.chocosolver.solver.constraints.Constraint;
 import org.chocosolver.solver.constraints.Propagator;
@@ -21,7 +20,8 @@ import org.chocosolver.util.procedure.UnaryIntProcedure;
 import org.chocosolver.util.tools.ArrayUtils;
 
 /**
- * Enforces multiple sets of variables values to be disjoint
+ * Enforces fixed sets of variables to have disjoint sets of values.
+ * Incremental filtering and supporting structures are designed for instances with few sets and values but many vars.
  * created sofdem - 08/09/11
  *
  * @author Sophie Demassey
@@ -29,7 +29,7 @@ import org.chocosolver.util.tools.ArrayUtils;
 public class Disjoint extends Constraint {
 
     /**
-     * @param vs sets of variables
+     * @param vs sets of variables vs[nbSets][nbVarsInSet]
      * @param c  max variable value + 1
      */
     public Disjoint(IntVar[][] vs, int c) {
@@ -39,32 +39,32 @@ public class Disjoint extends Constraint {
     static class DisjointPropagator extends Propagator<IntVar> {
 
         /**
-         * the variable domains must be included in [0, nbValues-1]
+         * the variable domains are included in [0, nbValues-1]
          */
         private final int nbValues;
 
         /**
-         * the number of groups
+         * the number of sets
          */
-        private final int nbGroups;
+        private final int nbSets;
 
         /**
-         * indices of variables in group 'g' is between groupIdx[g] and groupIdx[g+1]
-         * with 0 <= g < nbGroups
+         * indices of the variables in 'vars' belonging to set 's' are between 'setIdx[s]' and 'setIdx[s+1]'
+         * with 0 <= s < nbSets
          */
-        private final int[] groupIdx;
+        private final int[] setIdx;
 
         /**
-         * candidates[g][v] = number of variables in group 'g' which can be assigned to value 'v',
-         * with 0 <= g < nbGroups and 0 <= v < nbValues
+         * candidates[s][v] = maximum number of variables in set 's' which can be assigned to value 'v',
+         * with 0 <= s < nbSets and 0 <= v < nbValues
          */
         private final IStateInt[][] candidates;
 
         /**
-         * required[g].get(v) iff at least one variable in group 'g' is assigned to value 'v',
-         * with 0 <= g < nbGroups and 0 <= v < nbValues
+         * reserved[v] = s+1 iff at least one variable in set 's' is assigned to value 'v' (care of the offset +1)
+         * with 0 <= s < nbSets and 0 <= v < nbValues
          */
-        private final IStateBitSet[] required;
+        private final IStateInt[] reserved;
 
         private final IIntDeltaMonitor[] idms;
 
@@ -79,19 +79,22 @@ public class Disjoint extends Constraint {
         public DisjointPropagator(IntVar[][] vs, int c) {
             super(ArrayUtils.flatten(vs), PropagatorPriority.VERY_SLOW, true);
             nbValues = c;
-            nbGroups = vs.length;
-            groupIdx = new int[nbGroups + 1];
-            candidates = new IStateInt[nbGroups][c];
-            required = new IStateBitSet[nbGroups];
-            groupIdx[0] = 0;
+            nbSets = vs.length;
+            setIdx = new int[nbSets + 1];
+            candidates = new IStateInt[nbSets][c];
+            reserved = new IStateInt[nbValues];
+
+            setIdx[0] = 0;
             int idx = 0;
-            for (int g = 0; g < nbGroups; g++) {
-                idx += vs[g].length;
-                groupIdx[g + 1] = idx;
-                required[g] = getModel().getEnvironment().makeBitSet(c);
-                for (int v = 0; v < c; v++) {
-                    candidates[g][v] = getModel().getEnvironment().makeInt(0);
+            for (int s = 0; s < nbSets; s++) {
+                idx += vs[s].length;
+                setIdx[s + 1] = idx;
+                for (int v = 0; v < nbValues; v++) {
+                    candidates[s][v] = getModel().getEnvironment().makeInt(0);
                 }
+            }
+            for (int v = 0; v < nbValues; v++) {
+                reserved[v] = getModel().getEnvironment().makeInt(0);
             }
 
             idms = new IIntDeltaMonitor[vars.length];
@@ -108,157 +111,210 @@ public class Disjoint extends Constraint {
             return IntEventType.all();
         }
 
+        /**
+          Check for every value 'v' that the variables assigned to 'v' all belong to the same set
+         */
         @Override
         public ESat isEntailed() {
-            // Track the group using every value with an offset of 1. i.e. group 0 uses marks the value with 1. The
-            // offset prevents from filling the array with a neutral value (-1).
+            // usedBy[v]=s+1 if value 'v' is assigned to vars in set 's', usedBy[v]= if 'v' is not assigned
             final int[] usedBy = new int[nbValues];
-            // Default: no group.
-            for (int i = 0; i < vars.length; i++) {
-                // Get the group id with the offset.
-                int g = getGroup(i) + 1;
-                int v = vars[i].getValue();
-                if (usedBy[v] == 0) {
-                    // The value is not used by any group, mark it for this group.
-                    usedBy[v] = g;
-                } else if (usedBy[v] != g) {
-                    // The value is used by another group. Failure.
-                    return ESat.FALSE;
+            int i = 0;
+            for (int s = 1; s <= nbSets; s++) {
+                for (; i < setIdx[s]; i++) {
+                    int v = vars[i].getValue();
+                    if (usedBy[v] == 0) {
+                        usedBy[v] = s;
+                    } else if (usedBy[v] < s) {
+                        return ESat.FALSE;
+                    }
                 }
-                // The value is used by the current group. This is fine.
             }
             return ESat.TRUE;
         }
 
-        public static long tot;
         /**
-         * Initialise required and candidate for a given variable that belong to a given group.
+         * At initial propagation: fill in 'resTmp' or 'candidate'  if 'var' is instantiated or not
          *
-         * @param var   the variable
-         * @param group the group of the variable
+         * @param var    the variable index
+         * @param varSet the variable set index
+         * @param resTmp a temporary copy for reserved for the initial propagation
+         * @throws ContradictionException if 'var' is instantiated to a value reserved to another set than 'varSet'
          */
-        private void initVar(IntVar var, int group) {
+        private int initVar(IntVar var, int varSet, int[] resTmp) throws ContradictionException {
+            int val = -1;
             if (var.isInstantiated()) {
-                // The value is required in this group.
-                required[group].set(var.getValue());
-                return;
+                val = var.getValue();
+                if (resTmp[val] == 0) {
+                    resTmp[val] = varSet + 1;
+                } else if (resTmp[val] != varSet + 1) {
+                    fails();
+                }
             }
-            // The variable is not instantiated, this populates the candidate values for this group.
             int ub = var.getUB();
-            for (int val = var.getLB(); val <= ub; val = var.nextValue(val)) {
-                candidates[group][val].add(1);
+            assert ub < nbValues;
+            for (int v = var.getLB(); v <= ub; v = var.nextValue(v)) {
+                candidates[varSet][v].add(1);
             }
+            return val;
         }
 
+        /**
+         * First propagation: initialize 'reserved' and 'candidates' then propagate the instantiations
+         */
         @Override
         public void propagate(int m) throws ContradictionException {
-            if (first) {
-                first = false;
-                int i = 0;
-                for (int g = 0; g < nbGroups; g++) {
-                    for (; i < groupIdx[g + 1]; i++) {
-                        initVar(vars[i], g);
+            assert first;
+            // a temporary copy for 'reserved' before the first propagation (using same offset +1)
+            int[] resTmp = new int[nbValues];
+            // save the first and last instantiated values to prevent to loop over all values
+            int firstVal = nbValues;
+            int lastVal = -1;
+            int i = 0;
+            for (int s = 0; s < nbSets; s++) {
+                for (; i < setIdx[s + 1]; i++) {
+                    int resVal = initVar(vars[i], s, resTmp);
+                    if (resVal >= 0) {
+                        if (resVal < firstVal) {
+                            firstVal = resVal;
+                        }
+                        if (lastVal < resVal) {
+                            lastVal = resVal;
+                        }
                     }
                 }
             }
-            for (int v = 0; v < nbValues; v++) {
-                for (int g = 0; g < nbGroups; g++) {
-                    if (required[g].get(v)) {
-                        setRequired(g, v);
-                    }
-                }
-            }
+
             for (final IIntDeltaMonitor dm : idms) {
                 dm.startMonitoring();
             }
+            // propagate the instantiations discovered in 'resTmp' and initialize 'reserved'
+            for (int v = firstVal; v <= lastVal; v++) {
+                if (resTmp[v] > 0) {
+                    reserveValue(resTmp[v] - 1, v);
+                }
+            }
+            first = false;
         }
 
         @Override
         public void propagate(int idx, int mask) throws ContradictionException {
             if (IntEventType.isInstantiate(mask)) {
-                int group = getGroup(idx);
-                if (!required[group].get(vars[idx].getValue())) {
-                    setRequired(group, vars[idx].getValue());
-                }
+                reserveValue(getVarSet(idx), vars[idx].getValue());
             }
             if (IntEventType.isRemove(mask)) {
-                idms[idx].forEachRemVal(remProc.set(idx));
+                idms[idx].forEachRemVal(remProc.set(getVarSet(idx)));
             }
         }
 
         /**
-         * update the internal data and filter when a variable is newly instantiated
-         * 1) fail if a variable in the other group is already instantiated to this value
-         * 2) remove the value of the domains of all the variables of the other group
+         * propagate the assignment of value 'val' to variable set 'varSet' recursively:
+         * 0) do nothing if already assigned
+         * 1) fail if 'val' is already assigned to another set
+         * 2) remove 'val' from the variables in the other candidate sets and propagate the possible new instantiations
          *
-         * @param group the group of the new instantiated variable
-         * @param val   the new assigned value
-         * @throws ContradictionException when some variables in both groups are instantiated to the same value
+         * @param varSet the variable set
+         * @param val    the value
+         * @throws ContradictionException if some variables in different sets are instantiated to the same value
          */
-        public void setRequired(int group, int val) throws ContradictionException {
-            required[group].set(val);
-            for (int g = 0; g < nbGroups; g++) {
-                if (g == group) {
-                    continue;
-                }
-                if (required[g].get(val)) {
-                    //The value is used in the other group. It's a contradiction.
-                    fails();
-                }
-                if (candidates[g][val].get() == 0) {
-                    // The value is not possible in this group. Nothing to remove.
-                    continue;
-                }
-                //The value is possible for this group. Remove it.
-                for (int i = groupIdx[g]; i < groupIdx[g + 1]; i++) {
+        public void reserveValue(int varSet, int val) throws ContradictionException {
+            int resSet = reserved[val].get();
+
+            // 0/ do nothing if 'val' is already assigned to 'varSet'
+            if (resSet == varSet + 1) {
+                return;
+            }
+            // 1/ throw contradiction if 'val' is already assigned to another set than 'varSet'
+            if (resSet > 0) {
+                fails();
+            }
+            reserved[val].set(varSet + 1);
+            // 2/ remove 'val' from the variables in the other sets, trying not to visit all the variables by using
+            // 'candidates[s][val]' which estimates the maximum number of vars to consider in set s
+            // may temporarily be > to the actual number because of the recursion (not a bug, just extra work).
+            int i = 0;
+            for (int s = 0; s < nbSets; s++) {
+                int c = (s==varSet) ? 0: candidates[s][val].get();
+                i = setIdx[s];
+                for (; c > 0 && i < setIdx[s + 1]; i++) {
                     if (vars[i].removeValue(val, this)) {
-                        candidates[g][val].add(-1);
-                        if (vars[i].isInstantiated() && !required[g].get(vars[i].getValue())) {
-                            setRequired(g, vars[i].getValue());
+                        c--;
+                        if (vars[i].isInstantiated()) {
+                            reserveValue(s, vars[i].getValue());
                         }
                     }
                 }
+                candidates[s][val].set(0);
             }
         }
 
         /**
-         * Get the group of a given variable.
-         * This lookup is done recursively.
+         * Get the set of a given variable.
+         * This lookup is done recursively by dichotomy.
          *
-         * @param idx the variable.
-         * @return the group.
+         * @param varIdx the variable.
+         * @return the set.
          */
-        private int getGroup(int idx) {
-            return getGroup(idx, 0, nbGroups);
+        private int getVarSet(int varIdx) {
+            return getVarSet(varIdx, 0, nbSets);
         }
 
-        private int getGroup(int idx, int s, int e) {
-            assert e > s && groupIdx[s] <= idx && idx < groupIdx[e];
+        private int getVarSet(int varIdx, int s, int e) {
+            assert e > s && setIdx[s] <= varIdx && varIdx < setIdx[e];
             if (e == s + 1) {
                 return s;
             }
             // Complicated average computation that should prevent an overflow
             //from findbug point of view.
             int m = (s + e) >>> 1;
-            if (idx >= groupIdx[m]) {
-                return getGroup(idx, m, e);
+            if (varIdx >= setIdx[m]) {
+                return getVarSet(varIdx, m, e);
             }
-            return getGroup(idx, s, m);
+            return getVarSet(varIdx, s, m);
 
         }
 
         private class RemProc implements UnaryIntProcedure<Integer> {
-            private int group;
+            private int set;
 
             @Override
-            public UnaryIntProcedure<Integer> set(Integer idxVar) {
-                this.group = getGroup(idxVar);
+            public UnaryIntProcedure<Integer> set(Integer set) {
+                this.set = set;
                 return this;
             }
 
             @Override
             public void execute(int val) {
-                candidates[group][val].add(-1);
+                candidates[set][val].add(-1);
+            }
+        }
+
+
+        private void checkCandidates(int s, int val) {
+            if (reserved[val].get() == s + 1) {
+                return;
+            }
+            int c = candidates[s][val].get();
+            int nbVars = 0;
+            for (int i = setIdx[s]; i < setIdx[s + 1]; i++) {
+                if (vars[i].contains(val)) {
+                    nbVars++;
+                }
+            }
+            assert c >= nbVars : "candidates[" + s + "," + val + "] de-synchronized:" + c + " expected, " + nbVars + " found";
+        }
+
+
+        private void checkCandidates(boolean check) {
+            for (int s = 0; s < nbSets; s++) {
+                for (int v = 0; v < nbValues; v++) {
+                    int c = candidates[s][v].get();
+                    if (c != 0) {
+                        if (check) {
+                            checkCandidates(s, v);
+                        }
+                        System.out.println("candidates[" + s + "," + v + "] = " + c);
+                    }
+                }
             }
         }
     }
